@@ -1225,3 +1225,77 @@ test("SIGHUP during a blocked start exits 129 and cleans managed partial resourc
     });
   });
 });
+
+test("stop and restart retain data and credentials; failed restart also preserves them", () => {
+  withFakeBin((root, bin) => {
+    const name = "persistent-lifecycle-tooth";
+    const environmentDir = join(projectDir, ".slockdev", name);
+    const seedFile = join(projectDir, `.dev-env-${name}.json`);
+    const dockerState = join(root, "docker.state");
+    const tmuxState = join(root, "tmux.state");
+    const pnpmLog = join(root, "pnpm.log");
+    writeFileSync(dockerState, "");
+    writeFileSync(tmuxState, "");
+    writeFakeStartTools(bin);
+    const env = {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH ?? ""}`,
+      RAFTDEV_FAKE_DOCKER_STATE: dockerState,
+      RAFTDEV_FAKE_TMUX_STATE: tmuxState,
+      RAFTDEV_FAKE_PNPM_LOG: pnpmLog,
+      SLOCKDEV_TRACE_WORKER: "0",
+      SLOCKDEV_TUNNEL: "0",
+      SLOCKDEV_IDLE_TTL_SECONDS: "0",
+    };
+    const run = (command: string, overrides: Record<string, string> = {}) => {
+      const child = spawnSync(raftdev, [command, name], {
+        cwd: projectDir, encoding: "utf8", env: { ...env, ...overrides },
+      });
+      return child;
+    };
+    try {
+      const initial = run("start");
+      assert.equal(initial.status, 0, initial.stdout + initial.stderr);
+      const containersAndVolume = readFileSync(dockerState, "utf8");
+      const credentials = readFileSync(seedFile, "utf8");
+      const stopped = run("stop");
+      assert.equal(stopped.status, 0, stopped.stdout + stopped.stderr);
+      assert.equal(readFileSync(dockerState, "utf8"), containersAndVolume);
+      assert.equal(readFileSync(seedFile, "utf8"), credentials);
+      assert.equal(readFileSync(tmuxState, "utf8").trim(), "");
+      assert.equal(existsSync(join(environmentDir, "data-preserved")), true);
+
+      writeFileSync(pnpmLog, "");
+      const restarted = run("start");
+      assert.equal(restarted.status, 0, restarted.stdout + restarted.stderr);
+      assert.match(restarted.stdout, /schema push and test-data seed skipped/);
+      assert.doesNotMatch(readFileSync(pnpmLog, "utf8"), /scripts\/seed\.ts/);
+      assert.equal(readFileSync(seedFile, "utf8"), credentials);
+      assert.equal(readFileSync(dockerState, "utf8"), containersAndVolume);
+      assert.equal(run("stop").status, 0);
+
+      const failed = run("start", { RAFTDEV_FAKE_TMUX_START_EXIT: "9" });
+      assert.equal(failed.status, 9, failed.stdout + failed.stderr);
+      assert.match(failed.stdout, /existing data and credentials were preserved/);
+      assert.equal(readFileSync(dockerState, "utf8"), containersAndVolume);
+      assert.equal(readFileSync(seedFile, "utf8"), credentials);
+
+      // A missing database must never silently create an empty replacement.
+      writeFileSync(dockerState, containersAndVolume.replace(`C:slock-dev-${name}-pg\n`, ""));
+      const missing = run("start");
+      assert.equal(missing.status, 1);
+      assert.match(missing.stdout, /Preserved environment is missing/);
+      assert.equal(readFileSync(seedFile, "utf8"), credentials);
+      writeFileSync(dockerState, containersAndVolume);
+
+      const destroyed = run("destroy");
+      assert.equal(destroyed.status, 0, destroyed.stdout + destroyed.stderr);
+      assert.equal(readFileSync(dockerState, "utf8").trim(), "");
+      assert.equal(existsSync(seedFile), false);
+      assert.equal(existsSync(join(environmentDir, "data-preserved")), false);
+    } finally {
+      rmSync(environmentDir, { recursive: true, force: true });
+      rmSync(seedFile, { force: true });
+    }
+  });
+});

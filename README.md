@@ -55,6 +55,18 @@ pnpm install
 checks run through package scripts, for example
 `pnpm --filter @botiverse/raft-server test`.
 
+`./raftdev stop [name]` stops the applications and managed containers while
+preserving the database, attachments, agent files, and credentials.
+`./raftdev start [name]` resumes a stopped environment without pushing the
+schema or seeding test data again. It reuses the saved RisingWave connection
+and idle timeout. External RisingWave instances remain separately managed.
+Keep the Docker containers and volumes: stop/start persistence does not protect
+against deleting them. Apply schema changes deliberately when updating this
+checkout.
+
+Use `./raftdev destroy [name]` only to delete that environment's database and
+attachments. `./raftdev nuke` still deletes all managed environments.
+
 `pnpm --version` inside the repository must print the version declared in
 `packageManager`. Check the printed version, not whether the command runs:
 pnpm switches to the declared version by itself, but three older setups cannot

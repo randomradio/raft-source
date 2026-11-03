@@ -1007,7 +1007,8 @@ Usage: ./raftdev <command> [name]
 Commands:
   start [name] [--description <text>] [--replicas N] [--risingwave[=full|process-only]] [--with-onboarding]
                   Start an isolated dev environment
-  stop [name]     Stop and clean up an environment
+  stop [name]     Stop an environment and preserve its data for the next start
+  destroy [name]  Delete an environment's containers, database and attachments
   status          Show environment resources and application listeners
   seed [name] [--with-onboarding]
                   Re-run seed script; default fixture skips onboarding
@@ -1057,7 +1058,7 @@ Optional:
   RAFTDEV_RISINGWAVE=1|full|process-only provides the same profiles, and
   RAFTDEV_RISINGWAVE_IMAGE can override the pinned v2.8.0 image. To use an already-managed instance,
   set RISINGWAVE_DATABASE_URL without --risingwave; credentials are never
-  printed. Local standalone data is ephemeral and removed by raftdev stop.
+  printed. Local standalone data is preserved by stop and removed by destroy.
   See docs/operations/raftdev-risingwave.md.
   --latency <min>-<max> (or a single <n>) on start spawns an HTTP latency
   proxy in front of the dev server and points the Web's API requests at it.
@@ -1256,6 +1257,10 @@ function cmdStatus(): void {
     if (hasSession && readyServiceCount === 3 && listeners.every((entry) => entry.listening)) {
       const redisState = externalRedisListening ? "; Redis external" : "";
       out(`  Runtime    : running (tmux session + required services ready; application ports listening${redisState})`);
+    } else if (!hasSession && existsSync(join(e.SLOCKDEV_DIR, "data-preserved")) &&
+        environmentContainers.every((container) => !runningContainerNames.includes(container))) {
+      out("  Runtime    : stopped (data and credentials preserved)");
+      out(`  Resume     : ./raftdev start ${en}`);
     } else if (hasSession || dockerResidueCount > 0) {
       const sessionState = hasSession ? "tmux session present" : "no tmux session";
       out(`  Runtime    : partial/orphan (${sessionState}; ${readyServiceCount}/3 required services ready; ${dockerResidueCount} Docker residue(s))`);
@@ -1606,7 +1611,7 @@ function cmdSeed(args: string[]): void {
     } else if (cdcResidue === "unknown") {
       out("  Could not prove that Postgres is free of owned RisingWave CDC state.");
     }
-    out(`  Recovery: ./raftdev stop ${name} && ./raftdev start ${name} --risingwave`);
+    out(`  Rebuild (deletes data): ./raftdev destroy ${name} && ./raftdev start ${name} --risingwave`);
     process.exit(1);
   }
   if (
@@ -1617,13 +1622,13 @@ function cmdSeed(args: string[]): void {
     writeRisingWaveState(e, { ...risingWaveState, status: "failed" });
     out(`ERROR: Managed/full RisingWave is not running for '${name}'.`);
     out("  Postgres was not reseeded because strict CDC parity could not be proved.");
-    out(`  Recovery: ./raftdev stop ${name} && ./raftdev start ${name} --risingwave`);
+    out(`  Recovery: ./raftdev start ${name}`);
     process.exit(1);
   }
   if (risingWaveState?.mode === "local" && risingWaveState.profile === "full") {
     out(`ERROR: '${name}' is a managed/full CDC environment; live reseed is intentionally refused.`);
     out("  Rebuilding explicit CDC schemas requires quiescing server traffic and replacing the RisingWave catalog.");
-    out(`  Use: ./raftdev stop ${name} && ./raftdev start ${name} --risingwave`);
+    out(`  Rebuild (deletes data): ./raftdev destroy ${name} && ./raftdev start ${name} --risingwave`);
     process.exit(1);
   }
   out("Pushing database schema...");
@@ -1667,13 +1672,20 @@ function cmdSeed(args: string[]): void {
   out(`Done. Credentials: ${e.SEED_FILE}`);
 }
 
-function cmdStop(name: string): void {
+function cmdStop(name: string, destroy = false): void {
   const e = setupEnv(name);
   const risingWaveState = readRisingWaveState(e);
   const baseOwnershipProof = risingWaveState?.mode === "local" ||
     hasSeededEnvironmentOwnershipProof(e);
   let cleanupFailed = false;
-  out(`=== Stopping dev environment: ${name} ===`);
+  out(`=== ${destroy ? "Destroying" : "Stopping"} dev environment: ${name} ===`);
+  // Mark initialized data before stopping anything, including an interrupted stop.
+  const preservedDataFile = join(e.SLOCKDEV_DIR, "data-preserved");
+  if (!destroy && existsSync(e.SEED_FILE) && dockerNameExists(e.CONTAINER) &&
+      (dockerContainerIsRaftdevManaged(e.CONTAINER) || baseOwnershipProof)) {
+    mkdirSync(e.SLOCKDEV_DIR, { recursive: true });
+    writeFileSync(preservedDataFile, "1\n");
+  }
   if (tmuxHasSession(e.TMUX_SESSION)) {
     // C-c every actual window (covers cluster-mode server-2 … server-N too).
     for (const w of tmuxWindowNames(e.TMUX_SESSION)) {
@@ -1698,26 +1710,32 @@ function cmdStop(name: string): void {
       dockerContainerIsRaftdevManaged(e.RISINGWAVE_CONTAINER);
     if (!owned || risingWaveState?.mode === "external") {
       out(`External/unmanaged container '${e.RISINGWAVE_CONTAINER}' preserved.`);
-    } else if (sh("docker", ["rm", "-f", e.RISINGWAVE_CONTAINER], { quiet: true }).code === 0) {
-      out(`Container '${e.RISINGWAVE_CONTAINER}' removed.`);
+    } else if (sh("docker", destroy ? ["rm", "-f", e.RISINGWAVE_CONTAINER] : ["stop", e.RISINGWAVE_CONTAINER], { quiet: true }).code === 0) {
+      out(`Container '${e.RISINGWAVE_CONTAINER}' ${destroy ? "removed" : "stopped; data preserved"}.`);
     } else {
       cleanupFailed = true;
-      out(`ERROR: Failed to remove container '${e.RISINGWAVE_CONTAINER}'.`);
+      out(`ERROR: Failed to ${destroy ? "remove" : "stop"} container '${e.RISINGWAVE_CONTAINER}'.`);
     }
   }
   for (const c of [e.CONTAINER, e.REDIS_CONTAINER, e.RUSTFS_CONTAINER, e.OTELCOL_CONTAINER]) {
     if (dockerNameExists(c)) {
       if (!dockerContainerIsRaftdevManaged(c) && !baseOwnershipProof) {
         out(`Unowned container '${c}' preserved.`);
-      } else if (sh("docker", ["rm", "-f", c], { quiet: true }).code === 0) {
-        out(`Container '${c}' removed.`);
+      } else if (sh("docker", destroy ? ["rm", "-f", c] : ["stop", c], { quiet: true }).code === 0) {
+        out(`Container '${c}' ${destroy ? "removed" : "stopped; data preserved"}.`);
       } else {
         cleanupFailed = true;
-        out(`ERROR: Failed to remove container '${c}'.`);
+        out(`ERROR: Failed to ${destroy ? "remove" : "stop"} container '${c}'.`);
       }
     } else {
       out(`No container '${c}' found.`);
     }
+  }
+  if (!destroy) {
+    markTraceReaderStoppedIfPresent(e);
+    if (cleanupFailed) process.exitCode = 1;
+    out(`Data and credentials preserved. Resume with: ./raftdev start ${name}`);
+    return;
   }
   if (dockerNetworkExists(e.RISINGWAVE_NETWORK)) {
     const owned = (risingWaveState?.mode === "local" && risingWaveState.profile === "full") ||
@@ -1767,6 +1785,7 @@ function cmdStop(name: string): void {
     rmSync(e.RISINGWAVE_STATE_FILE, { force: true });
   }
   markTraceReaderStoppedIfPresent(e);
+  rmSync(preservedDataFile, { force: true });
   out("Done.");
 }
 
@@ -1922,6 +1941,7 @@ function cmdNuke(): void {
     ? readdirSync(environmentsRoot, { withFileTypes: true })
     : [])) {
     if (!entry.isDirectory()) continue;
+    rmSync(join(environmentsRoot, entry.name, "data-preserved"), { force: true });
     const statePath = join(environmentsRoot, entry.name, "traces", "reader-state.json");
     if (markTraceReaderStateFileStoppedIfPresent(statePath)) stoppedTraceReaders += 1;
     const risingWaveDsnFile = join(environmentsRoot, entry.name, "risingwave-database-url");
@@ -2077,6 +2097,12 @@ function cleanupFailedStart(
     } catch {
       // The child may already have exited; no resource remains to clean.
     }
+  }
+
+  if (existsSync(join(e.SLOCKDEV_DIR, "data-preserved"))) {
+    cmdStop(e.name);
+    out("Restart failed; existing data and credentials were preserved.");
+    return process.exitCode !== 1;
   }
 
   if (tmuxHasSession(e.TMUX_SESSION)) {
@@ -2281,11 +2307,21 @@ function cmdStart(args: string[]): void {
     process.exit(1);
   }
   const e = setupEnv(name);
+  const resume = existsSync(join(e.SLOCKDEV_DIR, "data-preserved"));
+  const savedRisingWave = resume ? readRisingWaveState(e) : null;
+  if (resume && risingWaveLocalRaw === undefined && !process.env.RISINGWAVE_DATABASE_URL &&
+      savedRisingWave?.mode === "local") {
+    risingWaveLocalRaw = savedRisingWave.profile ?? "full";
+  }
+  const savedRisingWaveUrl = resume && savedRisingWave?.mode === "external" &&
+    existsSync(e.RISINGWAVE_DSN_FILE) && risingWaveLocalRaw === undefined
+    ? readFileSync(e.RISINGWAVE_DSN_FILE, "utf8").trim()
+    : undefined;
   let risingWave: RisingWaveDependencyConfig;
   try {
     risingWave = resolveRisingWaveDependency(
       risingWaveLocalRaw,
-      process.env.RISINGWAVE_DATABASE_URL,
+      process.env.RISINGWAVE_DATABASE_URL ?? savedRisingWaveUrl,
       e.RISINGWAVE_DATABASE_URL,
       process.env.RAFTDEV_RISINGWAVE_IMAGE,
     );
@@ -2340,7 +2376,8 @@ function cmdStart(args: string[]): void {
   // it empty rather than reading a dead SLOCKDEV_TRACE_WORKER_SECRET env (it
   // would never reach a process — cross-process auth is scope-attestation only).
   const traceWorkerSecret = traceWorker ? `trace-worker-dev-secret-${name}` : "";
-  const idleTtlSeconds = parseIdleTtlSeconds(process.env.SLOCKDEV_IDLE_TTL_SECONDS);
+  const idleTtlSeconds = parseIdleTtlSeconds(process.env.SLOCKDEV_IDLE_TTL_SECONDS ??
+    (resume ? readIntegerFile(e.IDLE_TTL_FILE)?.toString() : undefined));
   // Cluster mode: number of server replicas to launch. Validated before we
   // touch docker/tmux. 1 → single-replica (unchanged behavior).
   let replicas: number;
@@ -2352,6 +2389,18 @@ function cmdStart(args: string[]): void {
     process.exit(1);
   }
   validateStartTooling();
+  if (resume && (risingWave.mode !== (savedRisingWave?.mode ?? "disabled") ||
+      (risingWave.mode === "local" && risingWave.profile !== savedRisingWave?.profile))) {
+    out("ERROR: Cannot change RisingWave mode while resuming preserved data. Use the original configuration.");
+    process.exit(1);
+  }
+  if (resume && (!existsSync(e.SEED_FILE) || !dockerNameExists(e.CONTAINER) ||
+      !dockerNameExists(e.RUSTFS_CONTAINER) || !dockerVolumeExists(e.RUSTFS_VOLUME) ||
+      (risingWave.mode === "local" && !dockerNameExists(e.RISINGWAVE_CONTAINER)))) {
+    out("ERROR: Preserved environment is missing its database, attachments, credentials, or RisingWave container.");
+    out("Restore the missing resources before restarting. No data was changed.");
+    process.exit(1);
+  }
   // Validate latency early — malformed values should fail before we touch
   // docker / tmux. Unset → undefined → proxy never spawns, slockdev start
   // is byte-for-byte unchanged.
@@ -2528,7 +2577,7 @@ function cmdStart(args: string[]): void {
     risingWaveNetwork: previousRisingWaveState?.mode === "local" &&
       previousRisingWaveState.profile === "full",
   });
-  const risingWaveFull = risingWaveNeedsBootstrap(risingWave);
+  const risingWaveFull = risingWaveNeedsBootstrap(risingWave) && !resume;
   if (risingWaveFull) {
     // Full mode is intentionally ephemeral/destructive. Recreate both database
     // containers and their bridge so a process-only residue cannot silently
@@ -2618,7 +2667,13 @@ function cmdStart(args: string[]): void {
   // a single process (`single_node`) exposing pgwire :4566 and dashboard :5691.
   // It is deliberately independent from the local Postgres/Redis lifecycle;
   // RISINGWAVE_DATABASE_URL selects it only when the developer opted in.
-  if (risingWave.mode === "local") {
+  if (risingWave.mode === "local" && resume) {
+    const result = sh("docker", ["start", e.RISINGWAVE_CONTAINER], { quiet: true });
+    if (result.code !== 0) {
+      out("ERROR: Failed to resume preserved RisingWave container.");
+      process.exit(1);
+    }
+  } else if (risingWave.mode === "local") {
     let launchCode = 0;
     if (dockerNameExists(e.RISINGWAVE_CONTAINER)) {
       if (
@@ -2745,42 +2800,46 @@ function cmdStart(args: string[]): void {
     process.exit(1);
   }
 
-  out("Pushing database schema...");
-  const npxCommand = packageManagerCommand("npx");
-  let r = spawnSync(npxCommand, ["drizzle-kit", "push", "--force"], {
-    cwd: join(PROJECT_DIR, "packages/server"),
-    env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
-    stdio: "inherit",
-    shell: packageManagerSpawnShell(),
-  });
-  if ((r.status ?? 1) !== 0) {
-    updateRisingWaveStatus("failed");
-    process.exit(r.status ?? 1);
-  }
-  out("Schema is up to date.");
+  if (!resume) {
+    out("Pushing database schema...");
+    const npxCommand = packageManagerCommand("npx");
+    let r = spawnSync(npxCommand, ["drizzle-kit", "push", "--force"], {
+      cwd: join(PROJECT_DIR, "packages/server"),
+      env: { ...process.env, DATABASE_URL: e.DATABASE_URL },
+      stdio: "inherit",
+      shell: packageManagerSpawnShell(),
+    });
+    if ((r.status ?? 1) !== 0) {
+      updateRisingWaveStatus("failed");
+      process.exit(r.status ?? 1);
+    }
+    out("Schema is up to date.");
 
-  out("Seeding test data...");
-  r = spawnSync(packageManagerCommand("pnpm"), buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
-    cwd: join(PROJECT_DIR, "packages/server"),
-    env: {
-      ...process.env,
-      DATABASE_URL: e.DATABASE_URL,
-      S3_ENDPOINT: e.S3_ENDPOINT,
-      S3_REGION: "us-east-1",
-      S3_FORCE_PATH_STYLE: "true",
-      S3_ACCESS_KEY_ID: e.RUSTFS_ACCESS_KEY,
-      S3_SECRET_ACCESS_KEY: e.RUSTFS_SECRET_KEY,
-      S3_ATTACHMENTS_BUCKET: e.RUSTFS_BUCKET,
-      S3_CDN_BUCKET: e.RUSTFS_BUCKET,
-    },
-    stdio: "inherit",
-    shell: packageManagerSpawnShell(),
-  });
-  if ((r.status ?? 1) !== 0) {
-    updateRisingWaveStatus("failed");
-    process.exit(r.status ?? 1);
+    out("Seeding test data...");
+    r = spawnSync(packageManagerCommand("pnpm"), buildDevSeedArgs(e.SEED_FILE, withOnboarding), {
+      cwd: join(PROJECT_DIR, "packages/server"),
+      env: {
+        ...process.env,
+        DATABASE_URL: e.DATABASE_URL,
+        S3_ENDPOINT: e.S3_ENDPOINT,
+        S3_REGION: "us-east-1",
+        S3_FORCE_PATH_STYLE: "true",
+        S3_ACCESS_KEY_ID: e.RUSTFS_ACCESS_KEY,
+        S3_SECRET_ACCESS_KEY: e.RUSTFS_SECRET_KEY,
+        S3_ATTACHMENTS_BUCKET: e.RUSTFS_BUCKET,
+        S3_CDN_BUCKET: e.RUSTFS_BUCKET,
+      },
+      stdio: "inherit",
+      shell: packageManagerSpawnShell(),
+    });
+    if ((r.status ?? 1) !== 0) {
+      updateRisingWaveStatus("failed");
+      process.exit(r.status ?? 1);
+    }
+    out("Seed data ready.");
+  } else {
+    out("Resuming existing database; schema push and test-data seed skipped.");
   }
-  out("Seed data ready.");
 
   if (risingWaveFull) {
     out("Bootstrapping managed RisingWave CDC and materialized-view graph...");
@@ -2805,7 +2864,7 @@ function cmdStart(args: string[]): void {
 
   out("Building @botiverse/raft (used by spawned agents for messaging)...");
   const pnpmCommand = packageManagerCommand("pnpm");
-  r = spawnSync(pnpmCommand, ["--filter", "@botiverse/raft", "build"], {
+  const r = spawnSync(pnpmCommand, ["--filter", "@botiverse/raft", "build"], {
     cwd: PROJECT_DIR, env: process.env, stdio: ["inherit", "ignore", "inherit"],
     shell: packageManagerSpawnShell(),
   });
@@ -3241,6 +3300,7 @@ async function main(argv: string[]): Promise<number | void> {
     }
     case "start":  cmdStart(argv.slice(1)); break;
     case "stop":   cmdStop(envName); break;
+    case "destroy": cmdStop(envName, true); break;
     case "status": cmdStatus(); break;
     case "seed":   cmdSeed(argv.slice(1)); break;
     case "script": cmdScript(argv.slice(1)); break;
